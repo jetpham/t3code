@@ -20,7 +20,10 @@ import { layer as checkpointCaptureServiceLayer } from "../CheckpointCaptureServ
 import { layer as checkpointServiceLayer } from "../CheckpointService.ts";
 import { layer as checkpointRollbackServiceLayer } from "../CheckpointRollbackService.ts";
 import { layer as commandPolicyLayer } from "../CommandPolicy.ts";
-import { layer as commandReceiptStoreLayer } from "../CommandReceiptStore.ts";
+import {
+  CommandReceiptStoreV2,
+  layer as commandReceiptStoreLayer,
+} from "../CommandReceiptStore.ts";
 import { layer as contextHandoffServiceLayer } from "../ContextHandoffService.ts";
 import { layer as effectOutboxLayer } from "../EffectOutbox.ts";
 import {
@@ -223,7 +226,10 @@ export function makeOrchestratorV2ProviderReplayLayer<
     readonly replayGate?: ProviderReplayGate;
     readonly threadForkServiceLayer?: Layer.Layer<ThreadForkServiceV2>;
   } = {},
-): Layer.Layer<OrchestratorV2, Error | MigrationError | PlatformError.PlatformError | SqlError> {
+): Layer.Layer<
+  CommandReceiptStoreV2 | OrchestratorV2,
+  Error | MigrationError | PlatformError.PlatformError | SqlError
+> {
   const registryLayer = harness.makeProviderAdapterRegistryLayer(
     scenario.transcript,
     options.replayGate === undefined ? {} : { replayGate: options.replayGate },
@@ -243,7 +249,10 @@ export function makeOrchestratorV2ReplayLayerWithRegistry<Error>(
     readonly runEffectWorker?: boolean;
     readonly threadForkServiceLayer?: Layer.Layer<ThreadForkServiceV2>;
   } = {},
-): Layer.Layer<OrchestratorV2, Error | MigrationError | PlatformError.PlatformError | SqlError> {
+): Layer.Layer<
+  CommandReceiptStoreV2 | OrchestratorV2,
+  Error | MigrationError | PlatformError.PlatformError | SqlError
+> {
   const serverConfigLayer = Layer.effect(
     ServerConfig,
     makeReplayServerConfig(scenario.name).pipe(Effect.orDie),
@@ -402,14 +411,17 @@ export function makeOrchestratorV2ReplayLayerWithRegistry<Error>(
   // orchestrator. Keeping this acquisition in the replay layer makes the
   // outbox lifecycle explicit and prevents test-only command-side draining.
   if (options.runEffectWorker === false) {
-    return orchestratorProvided;
+    return Layer.merge(orchestratorProvided, commandReceiptStoreProvided);
   }
-  return Layer.effect(
-    OrchestratorV2,
-    Effect.gen(function* () {
-      const orchestrator = yield* OrchestratorV2;
-      yield* runEffectWorkerDaemon.pipe(Effect.forkScoped);
-      return orchestrator;
-    }),
-  ).pipe(Layer.provide(replayRuntime));
+  return Layer.merge(
+    Layer.effect(
+      OrchestratorV2,
+      Effect.gen(function* () {
+        const orchestrator = yield* OrchestratorV2;
+        yield* runEffectWorkerDaemon.pipe(Effect.forkScoped);
+        return orchestrator;
+      }),
+    ).pipe(Layer.provide(replayRuntime)),
+    commandReceiptStoreProvided,
+  );
 }

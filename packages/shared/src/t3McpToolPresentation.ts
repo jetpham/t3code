@@ -22,6 +22,7 @@ const T3_MCP_TOOL_DISPLAY_NAMES: Record<string, string> = {
   t3_thread_read: "Read a T3 thread",
   t3_thread_transfers: "List T3 thread context transfers",
   t3_thread_fork: "Fork a T3 conversation",
+  t3_thread_merge_back: "Merge back T3 conversation context",
   t3_thread_send: "Send to a T3 thread",
   t3_thread_wait: "Wait for a T3 thread",
   t3_thread_interrupt: "Interrupt a T3 thread",
