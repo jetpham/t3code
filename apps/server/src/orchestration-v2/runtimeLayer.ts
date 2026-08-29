@@ -245,7 +245,9 @@ const providerRuntimeRecoveryProvided = providerRuntimeRecoveryLayer.pipe(
 
 export const OrchestrationV2LayerLive = Layer.mergeAll(
   orchestratorProvided,
+  commandReceiptStoreProvided,
   threadManagementProvided,
+  providerSwitchServiceProvided,
   effectWorkerProvided,
   providerSessionManagerProvided,
   providerRuntimeRecoveryProvided,

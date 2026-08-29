@@ -67,6 +67,13 @@ const OrchestrationV2CreationFields = {
   creationSource: OrchestrationV2CreationSource,
 } as const;
 
+export const OrchestrationV2PolicyCeiling = Schema.Struct({
+  callerThreadId: ThreadId,
+  runtimeMode: RuntimeMode,
+  interactionMode: ProviderInteractionMode,
+});
+export type OrchestrationV2PolicyCeiling = typeof OrchestrationV2PolicyCeiling.Type;
+
 export const OrchestrationV2NativeRefStrength = Schema.Literals(["strong", "weak", "none"]);
 export type OrchestrationV2NativeRefStrength = typeof OrchestrationV2NativeRefStrength.Type;
 
@@ -2100,18 +2107,23 @@ export const OrchestrationV2Command = Schema.Union([
     commandId: CommandId,
     threadId: ThreadId,
     runtimeMode: RuntimeMode,
+    policyCeiling: Schema.optional(OrchestrationV2PolicyCeiling),
   }),
   Schema.Struct({
     type: Schema.Literal("thread.interaction-mode.set"),
     commandId: CommandId,
     threadId: ThreadId,
     interactionMode: ProviderInteractionMode,
+    policyCeiling: Schema.optional(OrchestrationV2PolicyCeiling),
   }),
   Schema.Struct({
     type: Schema.Literal("thread.model-selection.set"),
     commandId: CommandId,
     threadId: ThreadId,
     modelSelection: ModelSelection,
+    /** Reject this partial-selection write if the thread changed since it was resolved. */
+    expectedModelSelection: Schema.optional(ModelSelection),
+    policyCeiling: Schema.optional(OrchestrationV2PolicyCeiling),
   }),
   Schema.Struct({
     type: Schema.Literal("provider-session.detach"),
@@ -2289,6 +2301,9 @@ export const OrchestrationV2Command = Schema.Union([
     commandId: CommandId,
     threadId: ThreadId,
     modelSelection: ModelSelection,
+    /** Reject this partial-selection write if the thread changed since it was resolved. */
+    expectedModelSelection: Schema.optional(ModelSelection),
+    policyCeiling: Schema.optional(OrchestrationV2PolicyCeiling),
   }),
 ]);
 export type OrchestrationV2Command = typeof OrchestrationV2Command.Type;
