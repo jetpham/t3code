@@ -461,6 +461,7 @@ export const OrchestratorMcpCapabilitiesResult = Schema.Struct({
     incrementalThreadRead: Schema.Boolean,
     scheduledTasks: Schema.Boolean,
     managedTerminals: Schema.optional(Schema.Boolean),
+    savedProjectScripts: Schema.optional(Schema.Boolean),
     maxBatchThreads: Schema.Number,
   }),
 });
