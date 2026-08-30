@@ -10,6 +10,7 @@ import {
 } from "@t3tools/contracts";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import * as Data from "effect/Data";
+import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Encoding from "effect/Encoding";
@@ -293,6 +294,130 @@ it.layer(
       assert.equal(first.terminalId, DEFAULT_TERMINAL_ID);
       assert.equal(second.threadId, "thread-1");
       assert.equal(third.threadId, "thread-1");
+      expect(ptyAdapter.spawnInputs).toHaveLength(1);
+    }),
+  );
+
+  it.effect("inspects loaded sessions without reading history or changing process state", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const { logsDir, manager, ptyAdapter } = yield* createManager();
+      const persistedPath = yield* multiTerminalHistoryLogPath(
+        logsDir,
+        "persisted-thread",
+        "term-persisted",
+      );
+      yield* fs.makeDirectory(logsDir, { recursive: true });
+      yield* fs.writeFileString(persistedPath, "persisted-only output\n");
+
+      assert.deepEqual(yield* manager.inspectThread("persisted-thread"), []);
+      assert.isNull(
+        yield* manager.inspectSession({
+          threadId: "persisted-thread",
+          terminalId: "term-persisted",
+        }),
+      );
+      assert.equal(yield* fs.readFileString(persistedPath), "persisted-only output\n");
+      expect(ptyAdapter.spawnInputs).toHaveLength(0);
+
+      yield* manager.openFresh(openInput({ threadId: "thread-1", terminalId: "term-a" }));
+      yield* manager.openFresh(openInput({ threadId: "thread-2", terminalId: "term-b" }));
+      const firstThread = yield* manager.inspectThread("thread-1");
+      expect(firstThread.map((terminal) => terminal.terminalId)).toEqual(["term-a"]);
+
+      const process = ptyAdapter.processes[0];
+      expect(process).toBeDefined();
+      if (!process) return;
+      process.emitData("retained output\n");
+      const outputSeen = yield* Deferred.make<void>();
+      const unsubscribe = yield* manager.subscribe((event) =>
+        event.type === "output" && event.threadId === "thread-1"
+          ? Deferred.succeed(outputSeen, undefined)
+          : Effect.void,
+      );
+      yield* Effect.addFinalizer(() => Effect.sync(unsubscribe));
+      process.emitData("second output\n");
+      yield* Deferred.await(outputSeen);
+      expect(
+        (yield* manager.inspectSession({ threadId: "thread-1", terminalId: "term-a" }))?.history,
+      ).toContain("second output");
+
+      yield* manager.clear({ threadId: "thread-1", terminalId: "term-a" });
+      assert.equal(
+        (yield* manager.inspectSession({ threadId: "thread-1", terminalId: "term-a" }))?.history,
+        "",
+      );
+
+      const exited = yield* Deferred.make<void>();
+      const unsubscribeExit = yield* manager.subscribe((event) =>
+        event.type === "exited" && event.threadId === "thread-1"
+          ? Deferred.succeed(exited, undefined)
+          : Effect.void,
+      );
+      yield* Effect.addFinalizer(() => Effect.sync(unsubscribeExit));
+      process.emitExit({ exitCode: 0, signal: null });
+      yield* Deferred.await(exited);
+      yield* manager.write({ threadId: "thread-1", terminalId: "term-a", data: "pwd\n" });
+      const strictWriteExit = yield* Effect.exit(
+        manager.writeStrict({ threadId: "thread-1", terminalId: "term-a", data: "pwd\n" }),
+      );
+      assert.isTrue(Exit.isFailure(strictWriteExit));
+      if (Exit.isFailure(strictWriteExit)) {
+        expect(strictWriteExit.cause.reasons[0]).toMatchObject({
+          _tag: "Fail",
+          error: { _tag: "TerminalNotRunningError" },
+        });
+      }
+      const inspected = yield* manager.openOrInspect(
+        openInput({ threadId: "thread-1", terminalId: "term-a" }),
+      );
+      assert.isFalse(inspected.created);
+      assert.equal(inspected.snapshot.status, "exited");
+      expect(ptyAdapter.spawnInputs).toHaveLength(2);
+
+      yield* manager.close({ threadId: "thread-1", terminalId: "term-a" });
+      assert.isNull(yield* manager.inspectSession({ threadId: "thread-1", terminalId: "term-a" }));
+    }),
+  );
+
+  it.effect("atomically rejects duplicate fresh terminal ids", () =>
+    Effect.gen(function* () {
+      const { manager, ptyAdapter } = yield* createManager();
+      const results = yield* Effect.all(
+        [
+          Effect.exit(manager.openFresh(openInput({ terminalId: "term-fresh" }))),
+          Effect.exit(manager.openFresh(openInput({ terminalId: "term-fresh" }))),
+        ],
+        { concurrency: "unbounded" },
+      );
+
+      assert.equal(results.filter(Exit.isSuccess).length, 1);
+      assert.equal(results.filter(Exit.isFailure).length, 1);
+      expect(ptyAdapter.spawnInputs).toHaveLength(1);
+      const failure = results.find(Exit.isFailure);
+      if (failure && Exit.isFailure(failure)) {
+        expect(failure.cause.reasons[0]).toMatchObject({
+          _tag: "Fail",
+          error: { _tag: "TerminalSessionAlreadyExistsError" },
+        });
+      }
+    }),
+  );
+
+  it.effect("restarts only loaded sessions through the existing-only path", () =>
+    Effect.gen(function* () {
+      const { manager, ptyAdapter } = yield* createManager();
+      const input = {
+        ...openInput({ terminalId: "term-existing-only" }),
+        cols: 120,
+        rows: 30,
+      };
+
+      const missing = yield* manager.restartExisting(input).pipe(Effect.flip);
+      assert.equal(missing._tag, "TerminalSessionLookupError");
+      expect(ptyAdapter.spawnInputs).toHaveLength(0);
+
+      yield* manager.restart(input);
       expect(ptyAdapter.spawnInputs).toHaveLength(1);
     }),
   );
@@ -866,7 +991,7 @@ it.layer(
     }),
   );
 
-  it.effect("ignores trailing writes after terminal exit", () =>
+  it.effect("keeps trailing UI writes as no-ops while strict writes reject after exit", () =>
     Effect.gen(function* () {
       const { manager, ptyAdapter } = yield* createManager();
       yield* manager.open(openInput());
@@ -881,6 +1006,20 @@ it.layer(
         terminalId: DEFAULT_TERMINAL_ID,
         data: "\r",
       });
+      const strictWrite = yield* Effect.exit(
+        manager.writeStrict({
+          threadId: "thread-1",
+          terminalId: DEFAULT_TERMINAL_ID,
+          data: "\r",
+        }),
+      );
+      assert.isTrue(Exit.isFailure(strictWrite));
+      if (Exit.isFailure(strictWrite)) {
+        expect(strictWrite.cause.reasons[0]).toMatchObject({
+          _tag: "Fail",
+          error: { _tag: "TerminalNotRunningError" },
+        });
+      }
       expect(process.writes).toEqual([]);
     }),
   );

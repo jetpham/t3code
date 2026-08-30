@@ -46,7 +46,7 @@ import { ContextHandoffServiceV2 } from "./ContextHandoffService.ts";
 import { EventSinkV2 } from "./EventSink.ts";
 import type { OrchestrationEffectRequestV2, PendingOrchestrationEffectV2 } from "./EffectOutbox.ts";
 import { IdAllocatorV2 } from "./IdAllocator.ts";
-import { makeKeyedSerialExecutor } from "./KeyedSerialExecutor.ts";
+import { ThreadDispatchLockV2 } from "./KeyedSerialExecutor.ts";
 import {
   applyToProjection,
   emptyProjection,
@@ -521,7 +521,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   const providerSwitchService = yield* ProviderSwitchServiceV2;
   const runtimePolicy = yield* RuntimePolicyV2;
   const threadForkService = yield* ThreadForkServiceV2;
-  const threadDispatch = yield* makeKeyedSerialExecutor<ThreadId>();
+  const threadDispatch = yield* ThreadDispatchLockV2;
 
   const mapDispatchError =
     (command: OrchestrationV2Command) =>
@@ -7215,6 +7215,7 @@ export const layer: Layer.Layer<
   | ContextHandoffServiceV2
   | EventSinkV2
   | IdAllocatorV2
+  | ThreadDispatchLockV2
   | ProviderAdapterRegistryV2
   | ProviderSessionManagerV2
   | ProviderSwitchServiceV2
