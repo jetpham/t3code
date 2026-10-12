@@ -3,6 +3,7 @@ import {
   MUSE_DEFAULT_MODEL,
   ProviderDriverKind,
   type ModelSelection,
+  type OrchestrationV2AppThread,
   type OrchestrationV2ConversationMessage,
   type OrchestrationV2ExecutionNode,
   type OrchestrationV2ProviderCapabilities,
@@ -20,8 +21,10 @@ import {
   type ProviderApprovalDecision,
   type RuntimeRequestId,
   type ServerProviderModel,
+  type ThreadId,
 } from "@t3tools/contracts";
 import type { MuseSettings } from "../settings.ts";
+import { AgentScope } from "@t3tools/shared/AgentScope";
 import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
 import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
@@ -35,8 +38,9 @@ import * as Semaphore from "effect/Semaphore";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
-import type { ProviderHostShape } from "@t3tools/provider-core/server/ProviderHost";
+import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import * as McpProviderSession from "@t3tools/provider-core/server/mcpSession";
+import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import { buildRuntimeInstructions } from "@t3tools/provider-core/server/runtimeInstructions";
 import { museModelCapabilities, resolveMuseReasoningEffort } from "./modelCatalog.ts";
 import {
@@ -60,50 +64,34 @@ import {
 import {
   createMuseSdkHostEffect,
   museApprovalMode,
+  museWorkspaceRoot,
   type createMuseSdkHost,
   type MuseSdkHost,
 } from "./sdk.ts";
-import type { EventNdjsonLogger } from "@t3tools/provider-core/server/ProviderEventLoggers";
+import type * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import {
   providerMessageTextWithAttachmentPaths,
   isProviderNativeImageAttachment,
 } from "@t3tools/provider-core/server/attachmentPrompt";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
-import {
-  ProviderAdapterEnsureThreadError,
-  ProviderAdapterForkThreadError,
-  ProviderAdapterInterruptError,
-  ProviderAdapterOpenSessionError,
-  ProviderAdapterProtocolError,
-  ProviderAdapterReadThreadSnapshotError,
-  ProviderAdapterResumeThreadError,
-  ProviderAdapterRollbackThreadError,
-  ProviderAdapterRuntimeRequestResponseError,
-  ProviderAdapterSteerRunError,
-  ProviderAdapterTurnStartError,
-  ProviderAdapterV2,
-  type ProviderAdapterV2Error,
-  type ProviderAdapterV2Event,
-  type ProviderAdapterV2EnsureThreadInput,
-  type ProviderAdapterV2OpenSessionInput,
-  type ProviderAdapterV2SessionRuntime,
-  type ProviderAdapterV2Shape,
-  type ProviderAdapterV2ThreadSnapshot,
-  type ProviderAdapterV2TurnInput,
-  type ProviderAdapterV2TurnMessage,
-} from "@t3tools/provider-core/server/ProviderAdapter";
+import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import {
   backgroundWorkNotification,
   type BackgroundWorkReport,
 } from "@t3tools/provider-core/server/notification";
-import type * as ProviderContinuationRequests from "@t3tools/provider-core/server/continuationRequests";
+import type * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
+import {
+  makeSubagentChildThread,
+  makeSubagentConversationArtifacts,
+  subagentThreadTitle,
+} from "@t3tools/provider-core/server/subagentProjection";
 import { turnScopedSelectionTransition } from "@t3tools/provider-core/server/selectionTransition";
 import { museItemStatus, museToolPresentation } from "./itemPresentation.ts";
 
 const MUSE_PROVIDER = ProviderDriverKind.make("muse");
-const isOpenSessionError = Schema.is(ProviderAdapterOpenSessionError);
-const isProtocolError = Schema.is(ProviderAdapterProtocolError);
+const isOpenSessionError = Schema.is(ProviderAdapter.ProviderAdapterOpenSessionError);
+const isProtocolError = Schema.is(ProviderAdapter.ProviderAdapterProtocolError);
 
 const MuseProviderCapabilitiesV2 = {
   runtimePolicy: { enforcement: "native" },
@@ -167,9 +155,9 @@ const MuseProviderCapabilitiesV2 = {
     planDeltasHaveItemIds: false,
   },
   subagents: {
-    supportsSubagents: false,
+    supportsSubagents: true,
     exposesSubagentThreadIds: false,
-    emitsSubagentLifecycle: false,
+    emitsSubagentLifecycle: true,
     canWaitForSubagents: false,
     canCloseSubagents: false,
     canForkSubagentThread: false,
@@ -203,13 +191,10 @@ export interface MuseAdapterV2Options {
   readonly instanceId: ProviderInstanceId;
   readonly settings: MuseSettings;
   readonly environment: NodeJS.ProcessEnv;
-  readonly idAllocator: IdAllocator.IdAllocatorV2["Service"];
-  readonly host: ProviderHostShape;
-  readonly fileSystem: FileSystem.FileSystem;
   readonly modelCatalog?: Effect.Effect<ReadonlyArray<ServerProviderModel>>;
   readonly createHost?: typeof createMuseSdkHost;
   readonly requestTimeoutMs?: number;
-  readonly nativeEventLogger?: EventNdjsonLogger;
+  readonly nativeEventLogger?: ProviderEventLoggers.EventNdjsonLogger;
   /** Where a turn Muse starts on its own (a finished workflow's report) asks for its run. */
   readonly continuationRequests?: {
     readonly offer: (
@@ -219,7 +204,7 @@ export interface MuseAdapterV2Options {
 }
 
 interface ActiveTurn {
-  readonly input: ProviderAdapterV2TurnInput;
+  readonly input: ProviderAdapter.ProviderAdapterV2TurnInput;
   providerTurn: OrchestrationV2ProviderTurn;
   readonly nativeId: string;
   /** Turns Muse started on its own while this run was active, which this run shows. */
@@ -248,6 +233,22 @@ interface PendingRequest {
   response?: Pick<OrchestrationV2RuntimeRequest, "decision" | "answers">;
 }
 
+/**
+ * One native subagent's child thread. Muse 1.4.4 cannot address an inline
+ * child session (`session/read` and `view/subscribe` answer sessionNotFound),
+ * so the thread carries the prompt, live status (on its root node) and result.
+ */
+interface ChildContext {
+  readonly childSessionId: string;
+  readonly childThreadId: ThreadId;
+  readonly appThread: OrchestrationV2AppThread;
+  readonly rootNodeId: NodeId;
+  readonly parentThreadId: ThreadId;
+  status: OrchestrationV2TurnItemStatus;
+  /** The result shown in the child thread, once the subagent settled. */
+  result?: string;
+}
+
 const nativeRef = (nativeId: string) => ({
   driver: MUSE_PROVIDER,
   nativeId,
@@ -267,21 +268,28 @@ const TOOLS_WITH_NATIVE_ROWS = new Set(["write_todos", "request_user_input", "wo
 const responseAnswerSchema = Schema.Union([Schema.String, Schema.Array(Schema.String)]);
 
 /** One scoped Muse host owns one native session; the orchestrator owns app runs and queuing. */
-export function makeMuseAdapterV2(options: MuseAdapterV2Options): ProviderAdapterV2Shape {
-  const { idAllocator } = options;
+export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
+  options: MuseAdapterV2Options,
+) {
+  const idAllocator = yield* IdAllocator.IdAllocatorV2;
+  const providerHost = yield* ProviderHost.ProviderHost;
+  const fileSystem = yield* FileSystem.FileSystem;
+  const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
+  const agentScope = yield* AgentScope;
+
   const protocolError = (detail: string, payload?: unknown) =>
-    new ProviderAdapterProtocolError({
+    new ProviderAdapter.ProviderAdapterProtocolError({
       driver: MUSE_PROVIDER,
       detail,
       ...(payload === undefined ? {} : { payload }),
     });
-  return ProviderAdapterV2.of({
+  return ProviderAdapter.ProviderAdapterV2.of({
     instanceId: options.instanceId,
     driver: MUSE_PROVIDER,
     getCapabilities: () => Effect.succeed(MuseProviderCapabilitiesV2),
     planSelectionTransition: () => Effect.succeed(turnScopedSelectionTransition()),
     openSession: Effect.fn("MuseAdapterV2.openSession")(function* (
-      input: ProviderAdapterV2OpenSessionInput,
+      input: ProviderAdapter.ProviderAdapterV2OpenSessionInput,
     ) {
       if (!options.settings.enabled) return yield* protocolError("Muse Code is disabled");
       if (input.runtimePolicy.interactionMode === "plan")
@@ -289,10 +297,11 @@ export function makeMuseAdapterV2(options: MuseAdapterV2Options): ProviderAdapte
       const scope = yield* Effect.scope;
       // Muse rejects non-canonical workspace roots (for example macOS /tmp) and
       // reports canonical paths in approvals, so resolve symlinks once here.
-      const requestedCwd = input.runtimePolicy.cwd ?? options.host.paths.cwd;
-      const cwd = yield* options.fileSystem
+      const requestedCwd = input.runtimePolicy.cwd ?? providerHost.paths.cwd;
+      const cwd = yield* fileSystem
         .realPath(requestedCwd)
         .pipe(Effect.orElseSucceed(() => requestedCwd));
+      const workspaceRoot = yield* museWorkspaceRoot(cwd);
       const now = yield* DateTime.now;
       let session: OrchestrationV2ProviderSession = {
         id: input.providerSessionId,
@@ -307,8 +316,8 @@ export function makeMuseAdapterV2(options: MuseAdapterV2Options): ProviderAdapte
         lastError: null,
       };
       const events = yield* Queue.unbounded<
-        ProviderAdapterV2Event,
-        ProviderAdapterV2Error | Cause.Done
+        ProviderAdapter.ProviderAdapterV2Event,
+        ProviderAdapter.ProviderAdapterV2Error | Cause.Done
       >();
       type Inbox =
         | { type: "notification"; method: string; params: unknown; epoch: number }
@@ -338,13 +347,17 @@ export function makeMuseAdapterV2(options: MuseAdapterV2Options): ProviderAdapte
       const seenTerminals = new Set<string>();
       // Workflows and subagents that outlive their turn, by item id, with the turn that owns them.
       const observedChildren = new Map<string, ActiveTurn>();
+      // Native subagents' child threads, by subagent item id.
+      const childrenByItemId = new Map<string, ChildContext>();
+      // Titles per native subagent and workflow child attempt; later revisions drop the label.
+      const agentTitles = new Map<string, string>();
       // Background work that finished since the last turn, reported to the turn Muse starts for it.
       const finishedBackground: Array<BackgroundWorkReport> = [];
       // A turn Muse started on its own, held until the continuation run T3 opens for it takes it.
       let wake:
         | { readonly nativeId: string; readonly events: Array<[string, unknown]> }
         | undefined;
-      const emit = (event: ProviderAdapterV2Event) =>
+      const emit = (event: ProviderAdapter.ProviderAdapterV2Event) =>
         Queue.offer(events, event).pipe(Effect.asVoid);
       const decode = <A, I>(schema: Schema.Codec<A, I>, data: unknown) =>
         Schema.decodeUnknownEffect(schema)(data).pipe(
@@ -436,6 +449,247 @@ export function makeMuseAdapterV2(options: MuseAdapterV2Options): ProviderAdapte
           updatedAt: time,
         };
       };
+      const childItemIdentity = (context: ChildContext, nativeId: string) =>
+        `${options.instanceId}:child:${context.childSessionId}:${nativeId}`;
+      /** A subagent with a ready result has finished its work even while Muse keeps it open. */
+      const itemStatus = (item: MuseItem): OrchestrationV2TurnItemStatus => {
+        const status = museItemStatus(item);
+        return status === "running" &&
+          item.kind === "subagent" &&
+          item.controlStatus === "resultReady"
+          ? "completed"
+          : status;
+      };
+      const publishChildRoot = Effect.fnUntraced(function* (
+        context: ChildContext,
+        status: OrchestrationV2TurnItemStatus,
+        time: DateTime.Utc,
+      ) {
+        context.status = status;
+        yield* emit({
+          type: "node.updated",
+          driver: MUSE_PROVIDER,
+          node: {
+            id: context.rootNodeId,
+            threadId: context.childThreadId,
+            runId: null,
+            parentNodeId: null,
+            rootNodeId: context.rootNodeId,
+            kind: "root_turn",
+            status,
+            countsForRun: false,
+            providerThreadId: null,
+            providerTurnId: null,
+            nativeItemRef: nativeRef(context.childSessionId),
+            runtimeRequestId: null,
+            checkpointScopeId: null,
+            startedAt: context.appThread.createdAt,
+            completedAt: status === "running" || status === "pending" ? null : time,
+          },
+        });
+      });
+      /** One synthesized conversation row in a child thread: its prompt or its result. */
+      const publishChildMessage = Effect.fnUntraced(function* (
+        context: ChildContext,
+        role: "user" | "assistant",
+        text: string,
+        suffix: "prompt" | "result",
+        time: DateTime.Utc,
+      ) {
+        const identity = childItemIdentity(context, suffix);
+        const artifacts = makeSubagentConversationArtifacts({
+          messageId: idAllocator.derive.messageFromProviderItem({
+            driver: MUSE_PROVIDER,
+            nativeItemId: identity,
+          }),
+          ...(role === "user" ? { senderThreadId: context.parentThreadId } : {}),
+          turnItemId: idAllocator.derive.turnItemFromProviderItem({
+            driver: MUSE_PROVIDER,
+            nativeItemId: identity,
+          }),
+          threadId: context.childThreadId,
+          rootNodeId: context.rootNodeId,
+          providerThreadId: null,
+          providerTurnId: null,
+          nativeItemRef: nativeRef(context.childSessionId),
+          role,
+          text,
+          ordinal: suffix === "prompt" ? 1 : 2,
+          now: time,
+        });
+        yield* emit({ type: "message.updated", driver: MUSE_PROVIDER, message: artifacts.message });
+        yield* emit({
+          type: "turn_item.updated",
+          driver: MUSE_PROVIDER,
+          turnItem: artifacts.turnItem,
+        });
+      });
+      /** Creates the child thread for a native subagent the first time its session id is known. */
+      const ensureChildContext = Effect.fnUntraced(function* (
+        turn: ActiveTurn,
+        item: MuseItem,
+        parentNodeId: NodeId,
+        title: string,
+        prompt: string,
+        status: OrchestrationV2TurnItemStatus,
+        time: DateTime.Utc,
+      ) {
+        const existing = childrenByItemId.get(item.itemId);
+        const childSessionId = item.childSessionId;
+        if (existing || !childSessionId) return existing;
+        const childThreadId = idAllocator.derive.threadFromProviderThread({
+          driver: MUSE_PROVIDER,
+          providerInstanceId: options.instanceId,
+          nativeThreadId: childSessionId,
+        });
+        const appThread = makeSubagentChildThread({
+          parentThread: turn.input.appThread,
+          childThreadId,
+          parentNodeId,
+          activeProviderThreadId: null,
+          providerInstanceId: options.instanceId,
+          modelSelection: turn.input.modelSelection,
+          title,
+          now: time,
+          createdBy: "agent",
+          creationSource: "provider",
+        });
+        const context: ChildContext = {
+          childSessionId,
+          childThreadId,
+          appThread,
+          rootNodeId: idAllocator.derive.nodeFromProviderItem({
+            driver: MUSE_PROVIDER,
+            nativeItemId: `${options.instanceId}:child:${childSessionId}:thread-root`,
+          }),
+          parentThreadId: turn.input.threadId,
+          status,
+        };
+        childrenByItemId.set(item.itemId, context);
+        yield* emit({ type: "app_thread.created", driver: MUSE_PROVIDER, appThread });
+        yield* publishChildRoot(context, status, time);
+        if (prompt) yield* publishChildMessage(context, "user", prompt, "prompt", time);
+        return context;
+      });
+      /**
+       * Shows a native subagent on its parent thread and mirrors it into a child
+       * thread the user can open, like Claude's and Codex's subagents.
+       */
+      const publishNativeSubagent = Effect.fnUntraced(function* (
+        turn: ActiveTurn,
+        item: MuseItem,
+        base: ReturnType<typeof baseItem> & {
+          readonly status: OrchestrationV2TurnItemStatus;
+          readonly completedAt: DateTime.Utc | null;
+          readonly title: string | null;
+        },
+        status: OrchestrationV2TurnItemStatus,
+        time: DateTime.Utc,
+      ) {
+        const prompt = item.objective ?? item.fallbackText ?? "";
+        const settled = status !== "running" && status !== "pending";
+        const endKey = `subagent:${item.itemId}`;
+        if (settled && !agentEndedAt.has(endKey)) agentEndedAt.set(endKey, time);
+        if (!settled) agentEndedAt.delete(endKey);
+        const completedAt = settled ? (agentEndedAt.get(endKey) ?? time) : null;
+        if (!agentTitles.has(endKey))
+          agentTitles.set(
+            endKey,
+            subagentThreadTitle({
+              parentTitle: turn.input.appThread.title,
+              prompt,
+              title: item.role ?? null,
+              ordinal: childrenByItemId.size + 1,
+            }),
+          );
+        const title = agentTitles.get(endKey)!;
+        const context = yield* ensureChildContext(
+          turn,
+          item,
+          base.nodeId,
+          title,
+          prompt,
+          status,
+          time,
+        );
+        const resultText =
+          item.result?.text ??
+          item.result?.summary ??
+          (status === "failed" ? item.failureReason : undefined);
+        const result = resultText ?? null;
+        const nativeTaskRef = item.childSessionId
+          ? nativeRef(item.childSessionId)
+          : nativeRef(item.subagentId ?? item.itemId);
+        const subagent: OrchestrationV2Subagent = {
+          id: base.nodeId,
+          threadId: base.threadId,
+          runId: base.runId,
+          parentNodeId: turn.input.rootNodeId,
+          origin: "provider_native",
+          createdBy: "agent",
+          driver: MUSE_PROVIDER,
+          providerInstanceId: options.instanceId,
+          providerThreadId: base.providerThreadId,
+          childThreadId: context?.childThreadId ?? null,
+          nativeTaskRef,
+          prompt,
+          title,
+          model: null,
+          status,
+          result,
+          startedAt: base.startedAt,
+          completedAt,
+          updatedAt: time,
+        };
+        yield* emit({ type: "subagent.updated", driver: MUSE_PROVIDER, subagent });
+        yield* emit({
+          type: "node.updated",
+          driver: MUSE_PROVIDER,
+          node: {
+            id: base.nodeId,
+            threadId: base.threadId,
+            runId: base.runId,
+            parentNodeId: turn.input.rootNodeId,
+            rootNodeId: turn.input.rootNodeId,
+            kind: "subagent",
+            status,
+            countsForRun: false,
+            providerThreadId: base.providerThreadId,
+            providerTurnId: base.providerTurnId,
+            nativeItemRef: nativeTaskRef,
+            runtimeRequestId: null,
+            checkpointScopeId: null,
+            startedAt: base.startedAt,
+            completedAt,
+          },
+        });
+        yield* emit({
+          type: "turn_item.updated",
+          driver: MUSE_PROVIDER,
+          turnItem: {
+            ...base,
+            nativeItemRef: nativeTaskRef,
+            type: "subagent",
+            status,
+            title,
+            completedAt,
+            subagentId: subagent.id,
+            origin: "provider_native",
+            driver: MUSE_PROVIDER,
+            providerInstanceId: options.instanceId,
+            childThreadId: subagent.childThreadId,
+            prompt,
+            result,
+          },
+        });
+        if (context) {
+          if (context.status !== status) yield* publishChildRoot(context, status, time);
+          if (settled && result?.trim() && context.result !== result) {
+            context.result = result;
+            yield* publishChildMessage(context, "assistant", result, "result", time);
+          }
+        }
+      });
       /** Lists running workflows and subagents on the thread, so it shows it still waits on them. */
       const syncBackground = Effect.fnUntraced(function* () {
         yield* updateThread({
@@ -469,7 +723,7 @@ export function makeMuseAdapterV2(options: MuseAdapterV2Options): ProviderAdapte
         )
           return;
         const time = yield* DateTime.now;
-        const status = terminal ?? museItemStatus(item);
+        const status = terminal ?? itemStatus(item);
         if (item.kind === "subagent" || item.kind === "workflow") {
           const wasRunning = observedChildren.has(item.itemId);
           if (status === "running") observedChildren.set(item.itemId, turn);
@@ -493,6 +747,10 @@ export function makeMuseAdapterV2(options: MuseAdapterV2Options): ProviderAdapte
           completedAt: streaming ? null : time,
           title: item.tool ?? null,
         };
+        if (item.kind === "subagent") {
+          yield* publishNativeSubagent(turn, item, base, status, time);
+          return;
+        }
         const text = item.text ?? item.summary?.join("\n") ?? item.fallbackText ?? "";
         let turnItem: OrchestrationV2TurnItem;
         if (item.kind === "agentMessage") {
@@ -572,8 +830,9 @@ export function makeMuseAdapterV2(options: MuseAdapterV2Options): ProviderAdapte
         for (const [index, child] of [...latest.values()].entries()) {
           const time = yield* DateTime.now;
           const base = baseItem(turn, `${item.itemId}:agent:${child.childId}`, time);
+          // Muse marks a failed attempt with `failureKind`, even when its terminal is `completed`.
           const status: OrchestrationV2TurnItemStatus =
-            child.terminal === "completed"
+            child.terminal === "completed" && child.failureKind === undefined
               ? "completed"
               : child.terminal === "cancelled"
                 ? "cancelled"
@@ -588,8 +847,10 @@ export function makeMuseAdapterV2(options: MuseAdapterV2Options): ProviderAdapte
           // Children are re-sent on every workflow change; keep each one's first end time.
           const endKey = `${item.itemId}:${child.childId}:${child.attempt}`;
           if (settled && !agentEndedAt.has(endKey)) agentEndedAt.set(endKey, time);
-          const title = child.label?.trim() || `Agent ${index + 1}`;
-          const result = child.failureReason ?? null;
+          // Later revisions drop the label; keep the last one seen.
+          if (child.label?.trim()) agentTitles.set(endKey, child.label.trim());
+          const title = agentTitles.get(endKey) || `Agent ${index + 1}`;
+          const result = child.failureReason ?? child.failureKind ?? null;
           const subagent: OrchestrationV2Subagent = {
             id: base.nodeId,
             threadId: base.threadId,
@@ -710,9 +971,12 @@ export function makeMuseAdapterV2(options: MuseAdapterV2Options): ProviderAdapte
         seenTerminals.add(turn.nativeId);
         const completedAt = yield* DateTime.now;
         for (const item of turn.items.values()) {
+          // Workflows and subagents outlive a completed turn. A stopped or failed
+          // turn ends them in T3 too, as the orchestrator stops following them.
           if (
             (item.kind === "subagent" || item.kind === "workflow") &&
             item.status === "inProgress" &&
+            status === "completed" &&
             disposition === "reusable"
           )
             continue;
@@ -1384,23 +1648,32 @@ export function makeMuseAdapterV2(options: MuseAdapterV2Options): ProviderAdapte
       );
       const launchHost = Effect.fnUntraced(function* () {
         const epoch = ++hostEpoch;
-        const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
+        const mcpSession = yield* mcpSessions.read(input.threadId);
+        const environment = McpProviderSession.withAgentDeviceEnvironment(
+          options.environment,
+          mcpSession,
+        );
+        const launch = yield* agentScope.wrap({
+          command: options.settings.binaryPath || "muse",
+          args: [],
+          name: "muse",
+          threadId: input.threadId,
+          env: environment,
+        });
         const created = yield* Effect.acquireRelease(
           createMuseSdkHostEffect(
             {
-              binaryPath: options.settings.binaryPath || "muse",
+              binaryPath: launch.command,
+              launchArgs: launch.args,
               cwd,
-              environment: McpProviderSession.withAgentDeviceEnvironment(
-                options.environment,
-                mcpSession,
-              ),
+              environment,
               runtimeMode: input.runtimePolicy.runtimeMode,
             },
             options.createHost,
           ).pipe(
             Effect.mapError(
               (error) =>
-                new ProviderAdapterOpenSessionError({
+                new ProviderAdapter.ProviderAdapterOpenSessionError({
                   driver: MUSE_PROVIDER,
                   providerSessionId: input.providerSessionId,
                   cause: error.cause,
@@ -1472,7 +1745,9 @@ export function makeMuseAdapterV2(options: MuseAdapterV2Options): ProviderAdapte
       );
       yield* launchHost();
 
-      const register = Effect.fnUntraced(function* (args: ProviderAdapterV2EnsureThreadInput) {
+      const register = Effect.fnUntraced(function* (
+        args: ProviderAdapter.ProviderAdapterV2EnsureThreadInput,
+      ) {
         if (broken || closed)
           return yield* protocolError("Muse host is unavailable; reopen the session");
         if (active)
@@ -1496,7 +1771,7 @@ export function makeMuseAdapterV2(options: MuseAdapterV2Options): ProviderAdapte
         let missingNativeSession = false;
         return yield* Effect.gen(function* () {
           nativeSessionId = requestedId ?? host.connection.mintCommandId();
-          const mcpSession = McpProviderSession.readMcpProviderSession(args.threadId);
+          const mcpSession = yield* mcpSessions.read(args.threadId);
           if (mcpSession && !host.initializeResult.grantedCapabilities.includes("sessionMcp"))
             return yield* protocolError(
               "Update Muse Code to a version that supports session MCP servers",
@@ -1592,19 +1867,21 @@ export function makeMuseAdapterV2(options: MuseAdapterV2Options): ProviderAdapte
           ),
         );
       });
-      const prompt = Effect.fnUntraced(function* (message: ProviderAdapterV2TurnMessage) {
+      const prompt = Effect.fnUntraced(function* (
+        message: ProviderAdapter.ProviderAdapterV2TurnMessage,
+      ) {
         const parts: SendUserTurnOptions<unknown>["input"] = [];
         const text = providerMessageTextWithAttachmentPaths({
           text: message.text,
           attachments: message.attachments,
-          resolveAttachmentPath: options.host.resolveAttachmentPath,
+          resolveAttachmentPath: providerHost.resolveAttachmentPath,
         });
         if (text) parts.push({ type: "text", text });
         for (const attachment of message.attachments)
           if (isProviderNativeImageAttachment(attachment)) {
-            const path = options.host.resolveAttachmentPath(attachment);
+            const path = providerHost.resolveAttachmentPath(attachment);
             if (!path) return yield* protocolError("Muse image attachment is missing");
-            const bytes = yield* options.fileSystem
+            const bytes = yield* fileSystem
               .readFile(path)
               .pipe(Effect.mapError((cause) => protocolError("Cannot read Muse image", cause)));
             parts.push({
@@ -1635,7 +1912,7 @@ export function makeMuseAdapterV2(options: MuseAdapterV2Options): ProviderAdapte
         );
       });
       const start = Effect.fnUntraced(function* (
-        turnInput: ProviderAdapterV2TurnInput,
+        turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
         compact = false,
       ) {
         if (!validateThread(turnInput.providerThread) || broken || closed)
@@ -1754,7 +2031,7 @@ export function makeMuseAdapterV2(options: MuseAdapterV2Options): ProviderAdapte
                 displayText: turnInput.message.text || "Image attachment",
                 // A resumed session keeps the root it was created with; pin it to
                 // this thread's current checkout so edits land where T3 tracks them.
-                workspaceRoots: [cwd],
+                workspaceRoots: [workspaceRoot],
                 ifBusy: "queue",
                 ...(effort ? { reasoningEffort: effort } : {}),
               },
@@ -1783,7 +2060,10 @@ export function makeMuseAdapterV2(options: MuseAdapterV2Options): ProviderAdapte
       // Only messages are read back; T3 owns turn and item history.
       const snapshot = Effect.fnUntraced(function* (
         current: OrchestrationV2ProviderThread,
-      ): Effect.fn.Return<ProviderAdapterV2ThreadSnapshot, ProviderAdapterV2Error> {
+      ): Effect.fn.Return<
+        ProviderAdapter.ProviderAdapterV2ThreadSnapshot,
+        ProviderAdapter.ProviderAdapterV2Error
+      > {
         const result = yield* request("session/read", { excludeItems: false }, false).pipe(
           Effect.flatMap((value) => decode(MuseSessionResult, value)),
         );
@@ -1821,7 +2101,7 @@ export function makeMuseAdapterV2(options: MuseAdapterV2Options): ProviderAdapte
           providerPayload: items,
         };
       });
-      const runtime: ProviderAdapterV2SessionRuntime = {
+      const runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime = {
         instanceId: options.instanceId,
         driver: MUSE_PROVIDER,
         providerSessionId: input.providerSessionId,
@@ -1836,7 +2116,7 @@ export function makeMuseAdapterV2(options: MuseAdapterV2Options): ProviderAdapte
             commands.withPermits(1),
             Effect.mapError(
               (cause) =>
-                new ProviderAdapterEnsureThreadError({
+                new ProviderAdapter.ProviderAdapterEnsureThreadError({
                   driver: MUSE_PROVIDER,
                   threadId: args.threadId,
                   cause,
@@ -1853,7 +2133,7 @@ export function makeMuseAdapterV2(options: MuseAdapterV2Options): ProviderAdapte
             commands.withPermits(1),
             Effect.mapError(
               (cause) =>
-                new ProviderAdapterResumeThreadError({
+                new ProviderAdapter.ProviderAdapterResumeThreadError({
                   driver: MUSE_PROVIDER,
                   providerSessionId: input.providerSessionId,
                   providerThreadId: args.providerThread.id,
@@ -1866,7 +2146,7 @@ export function makeMuseAdapterV2(options: MuseAdapterV2Options): ProviderAdapte
             commands.withPermits(1),
             Effect.mapError(
               (cause) =>
-                new ProviderAdapterTurnStartError({
+                new ProviderAdapter.ProviderAdapterTurnStartError({
                   driver: MUSE_PROVIDER,
                   threadId: args.threadId,
                   providerThreadId: args.providerThread.id,
@@ -1897,7 +2177,7 @@ export function makeMuseAdapterV2(options: MuseAdapterV2Options): ProviderAdapte
             commands.withPermits(1),
             Effect.mapError(
               (cause) =>
-                new ProviderAdapterSteerRunError({
+                new ProviderAdapter.ProviderAdapterSteerRunError({
                   driver: MUSE_PROVIDER,
                   providerThreadId: args.providerThread.id,
                   providerTurnId: args.providerTurnId,
@@ -1946,7 +2226,7 @@ export function makeMuseAdapterV2(options: MuseAdapterV2Options): ProviderAdapte
             commands.withPermits(1),
             Effect.mapError(
               (cause) =>
-                new ProviderAdapterInterruptError({
+                new ProviderAdapter.ProviderAdapterInterruptError({
                   driver: MUSE_PROVIDER,
                   providerThreadId: args.providerThread.id,
                   providerTurnId: args.providerTurnId,
@@ -1999,7 +2279,7 @@ export function makeMuseAdapterV2(options: MuseAdapterV2Options): ProviderAdapte
           }).pipe(
             Effect.mapError(
               (cause) =>
-                new ProviderAdapterRuntimeRequestResponseError({
+                new ProviderAdapter.ProviderAdapterRuntimeRequestResponseError({
                   driver: MUSE_PROVIDER,
                   requestId: args.requestId,
                   cause,
@@ -2014,7 +2294,7 @@ export function makeMuseAdapterV2(options: MuseAdapterV2Options): ProviderAdapte
             commands.withPermits(1),
             Effect.mapError(
               (cause) =>
-                new ProviderAdapterReadThreadSnapshotError({
+                new ProviderAdapter.ProviderAdapterReadThreadSnapshotError({
                   driver: MUSE_PROVIDER,
                   providerThreadId: args.providerThread.id,
                   cause,
@@ -2025,7 +2305,7 @@ export function makeMuseAdapterV2(options: MuseAdapterV2Options): ProviderAdapte
         // portable context handoff for forks and does not rewind Muse conversations.
         rollbackThread: (args) =>
           Effect.fail(
-            new ProviderAdapterRollbackThreadError({
+            new ProviderAdapter.ProviderAdapterRollbackThreadError({
               driver: MUSE_PROVIDER,
               providerThreadId: args.providerThread.id,
               checkpointId: args.target.checkpointId,
@@ -2034,7 +2314,7 @@ export function makeMuseAdapterV2(options: MuseAdapterV2Options): ProviderAdapte
           ),
         forkThread: (args) =>
           Effect.fail(
-            new ProviderAdapterForkThreadError({
+            new ProviderAdapter.ProviderAdapterForkThreadError({
               driver: MUSE_PROVIDER,
               providerThreadId: args.sourceProviderThread.id,
               cause: "Muse Code does not support native forks in T3 Code.",
@@ -2044,4 +2324,4 @@ export function makeMuseAdapterV2(options: MuseAdapterV2Options): ProviderAdapte
       return runtime;
     }),
   });
-}
+});
